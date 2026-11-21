@@ -1,3 +1,3 @@
-# field notes
+# fn
 
-Personal scratch space.
+Inputs: mechfight.py is the organizer-provided protocol wrapper from the starter kit. Everything else is original.
