@@ -1,3 +1,3 @@
 # fn
 
-Inputs: mechfight.py is the organizer-provided protocol wrapper from the starter kit. Everything else is original.
+A bot for a JSON-lines arena protocol. Original code, MIT licensed. No third-party code or repositories were used.
