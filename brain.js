@@ -25,7 +25,7 @@ export const BASE = {
   lootRadius: 90, crateUntil: 150, dodge: true, noMortar: true, peek: true, laserFirst: false, crowdHide: true, practice: true, opening: true,
   laserSeek: 0, stick: 0, hpw: 0, lowBonus: 0, maxTarget: 0, loseRule: false, fightLoot: 0, farmHP: 0, laserUp: false, finish: 0,
 }
-const squad = (p) => ({ ...p, ghost: false, peek: false, laserFirst: true, laserRange: 120, lootRadius: 150, crateUntil: 1e9, stick: 120, hpw: 0.2, lowBonus: 100, maxTarget: 240, loseRule: true, fightLoot: 70, farmHP: 0.5, laserSeek: 240, laserUp: true, finish: 14 })
+const squad = (p) => ({ ...p, ghost: false, peek: false, laserFirst: true, laserRange: 120, lootRadius: 150, crateUntil: 1e9, stick: 120, hpw: 0.2, lowBonus: 100, maxTarget: 240, loseRule: true, fightLoot: 40, farmHP: 0.5, laserSeek: 240, laserUp: true, finish: 20 })
 
 function normalize(o, cfg) {
   const me = o.self
