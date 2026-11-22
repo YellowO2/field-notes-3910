@@ -39,6 +39,22 @@ const NTGT_ = 8
 const SCRIPT_AIM = ((typeof process !== 'undefined' && process.env?.SCRIPT_AIM) || 'off') === 'on' // brain/script split: script owns aim + trigger
 const FIRE_MODE = (typeof process !== 'undefined' && process.env?.FIRE_MODE) || 'raw' // raw | gated (old: 1 = fire when aimed)
 const LASER_MODE = (typeof process !== 'undefined' && process.env?.LASER_MODE) || 'script' // script (default) | raw | hybrid; relay tests: raw/hybrid scored 5.02 vs script 5.92
+// CTRL_FIX=1: between policy decisions keep the move direction fixed in world frame, pick upgrades only on a decision
+// tick whose observation had the offer, and reload if either the script or the policy wants to
+const CTRL_FIX = (typeof process !== 'undefined' && process.env?.CTRL_FIX) === '1'
+// LOOK_NET=1 (with SCRIPT_AIM=on): while no mech target is engaged the network's look head picks the facing.
+// look 0 = the old script facing (drone/crate, last-damage bearing, move direction) | 1-44 = face (yaw at the decision
+// tick) + LOOK_OFFS[look], pitch 0, no shooting | 45 = script shoots the drone/crate it would pick, else holds the
+// decision-tick yaw. With a target the script's engage() aims as before. this.lookTicks counts the ticks of the
+// current decision on which the look head controlled the aim (env2.mjs reports it so only those decisions train it).
+const LOOK_NET = (typeof process !== 'undefined' && process.env?.LOOK_NET) === '1'
+// TGT_FIX=1: move 'path to target' follows the network's target pick (last known position if not seen this tick),
+// and the pick becomes lastTarget. The encoder (bot/obs.js) masks target slots not visible this tick.
+const TGT_FIX = (typeof process !== 'undefined' && process.env?.TGT_FIX) === '1'
+// HOLD_NET=1 (with SCRIPT_AIM=on): the network's fire0 head can veto the script's shots at an engaged mech for the
+// decision: fire0 == HOLD_VAL -> no trigger at mechs (aim as usual; a charging laser stays held), else the script fires.
+const HOLD_NET = (typeof process !== 'undefined' && process.env?.HOLD_NET) === '1'
+const HOLD_VAL = 1 // inverted: the untrained fire0 head of oldC_seed samples 0 on 85% of decisions, so 0 = fire keeps the default
 export class Brain {
   constructor(map, hello, params = {}) {
     this.map = map
@@ -174,25 +190,31 @@ export class Brain {
   // target: index into the encoder's target slots (this.tids), or NTGT/-1 for auto.
   actLow(obs, a, C, { target, foes, zoneGoal, hpFrac, nearestFoe }) {
     const me = obs.self, pos = me.pos, t = obs.t
+    let netPick = null
     if (C.target != null && this.tids && C.target < this.tids.length) {
       const pick = this.enemies.get(this.tids[C.target])
       if (pick && pick.seenNow) target = pick
+      if (TGT_FIX && pick) { netPick = pick; this.lastTarget = pick.id }
     }
     let goal = null
     const yaw = me.aim[0]
+    const fresh = C !== this.lastCtrl // a new policy decision (new ctrl object) arrived with this observation
+    this.lastCtrl = C
+    if (fresh) this.moveAng = yaw + (C.move - 1) * 2 * Math.PI / MOVE_DIRS // world move direction for this decision
+    if (fresh && LOOK_NET) { this.lookYaw = yaw; this.lookTicks = 0 }
     if (!me.in_zone && this.P.zoneAssist !== false && ZONE_ASSIST) goal = zoneGoal.p
     else if (this.forceGoal) goal = this.forceGoal
     else if (C.move >= 1 && C.move <= MOVE_DIRS) {
-      const ang = yaw + (C.move - 1) * 2 * Math.PI / MOVE_DIRS, dir = [Math.cos(ang), Math.sin(ang)]
+      const ang = CTRL_FIX ? this.moveAng : yaw + (C.move - 1) * 2 * Math.PI / MOVE_DIRS, dir = [Math.cos(ang), Math.sin(ang)]
       a.move = MOVE_ASSIST ? this.avoidWalls(pos, dir) : dir
     } else if (C.move === MOVE_DIRS + 1) goal = zoneGoal.p
     else if (C.move === MOVE_DIRS + 2) goal = this.lootGoal(obs) ?? zoneGoal.p
     else if (C.move === MOVE_DIRS + 3) goal = this.retreatPoint(obs, foes)
-    else if (C.move === MOVE_DIRS + 4) { const f = target ?? nearestFoe(); goal = f ? f.pos : zoneGoal.p }
+    else if (C.move === MOVE_DIRS + 4) { const f = netPick ?? target ?? nearestFoe(); goal = f ? f.pos : zoneGoal.p }
     if (goal) a.move = this.steer(pos, goal, t, obs)
     a.boost = !!C.boost
     a.jump = !!C.jump
-    if (SCRIPT_AIM) this.aimScripted(obs, a, target)
+    if (SCRIPT_AIM) LOOK_NET ? this.aimLookNet(obs, a, target, C) : this.aimScripted(obs, a, target)
     else if (C.look === LOOK_OBJ) {
       // scripted (leading) aim at the drone or crate closest to the current aim line
       let best = null, bb = 0.6
@@ -215,7 +237,9 @@ export class Brain {
       this.releaseLaserIfIdle(obs, a)
     }
     // --- decisions now made by the policy (each falls back to the old script when the field is absent)
-    if (SCRIPT_AIM) { /* trigger set by engage / engageObject */ }
+    if (SCRIPT_AIM) { /* trigger set by engage / engageObject */
+      if (HOLD_NET && target && C.fire && C.fire[0] === HOLD_VAL) for (let sl = 0; sl < 2; sl++) { const w = me.weapons[sl]; a.fire[sl] = !!(w && w.kind === 'laser' && w.charge > 0) }
+    }
     else if (C.fire && FIRE_MODE !== 'gated') { a.fire = [!!C.fire[0], !!C.fire[1]] } // raw trigger
     else if (C.fire) for (let sl = 0; sl < 2; sl++) {
       const w = me.weapons[sl]
@@ -231,7 +255,7 @@ export class Brain {
       a.fire[sl] = !!(w && w.kind === 'laser' && w.charge > 0) // hold: never start/fire; keep a charging laser held
     }
     if (C.slow) { const k = SPEEDS[C.slow] ?? 0.4; a.move = [a.move[0] * k, a.move[1] * k]; if (C.slow === 2) a.boost = false }
-    if (C.reload != null) a.reload = !!C.reload
+    if (C.reload != null) a.reload = CTRL_FIX ? !!a.reload || !!C.reload : !!C.reload
     if (C.take != null) {
       delete a.take; delete a.drop
       if (C.take > 0) {
@@ -247,7 +271,7 @@ export class Brain {
     if (C.upgrade != null) {
       delete a.pick
       if (obs.offer && UPG_PREF) { let best = 0, br = 1e9; obs.offer.choices.forEach((c, i) => { const r = UPG_PREF.indexOf(c.id); const rr = r < 0 ? 100 : r; if (rr < br) { br = rr; best = i } }); a.pick = best }
-      else if (obs.offer && C.upgrade < obs.offer.choices.length) a.pick = C.upgrade
+      else if (obs.offer && C.upgrade < obs.offer.choices.length && (fresh || !CTRL_FIX)) a.pick = C.upgrade
     }
     if (C.move !== 0 && !C.jump && MOVE_ASSIST) this.unstick(obs, a)
     a.debug = { label: `m${C.move}${C.slow ? 's' : ''}${C.boost ? 'b' : ''}${C.jump ? 'j' : ''} l${C.look} ${target ? '→' + target.id : ''}${C.fire && !C.fire[0] && !C.fire[1] ? ' hold' : ''} ${Math.round(hpFrac * 100)}%` }
@@ -277,6 +301,10 @@ export class Brain {
       this.soundTick = obs.tick
       for (const x of obs.sounds ?? []) this.sounds.push({ bearing: x.bearing, kind: x.kind, dist: x.dist, t: obs.t - (x.age ?? 0) })
       this.sounds = this.sounds.filter((x) => obs.t - x.t < 5).slice(-32)
+      // seen laser/lightning beams (kept 4 s): shooter's muzzle position = path[0]; read by bot/obs.js (OBS_V2)
+      this.beams ??= []
+      for (const b of obs.beams ?? []) if (b.path?.length) this.beams.push({ by: b.by, kind: b.kind, pos: b.path[0], t: obs.t - (b.age ?? 0) })
+      this.beams = this.beams.filter((x) => obs.t - x.t < 4).slice(-16)
     }
     this.recentAttackers ??= new Map()
     for (const e of obs.events) if (e.type === 'damaged' && e.by != null && e.by < 100) this.recentAttackers.set(e.by, obs.t)
@@ -580,6 +608,17 @@ export class Brain {
     if (sub) this.engageObject(obs, a, sub)
     else if (obs.t - this.lastDamage.t < 2) a.aim = [this.lastDamage.bearing, 0]
     else if (Math.hypot(a.move[0], a.move[1]) > 0.1) a.aim = [Math.atan2(a.move[1], a.move[0]), 0]
+    this.releaseLaserIfIdle(obs, a)
+  }
+
+  // LOOK_NET: as aimScripted, but with no mech target the network's look head decides the facing (see LOOK_NET above)
+  aimLookNet(obs, a, target, C) {
+    if (target) return this.engage(obs, a, target)
+    this.lookTicks = (this.lookTicks ?? 0) + 1 // no target: this tick's facing is the look head's choice (0 included)
+    if (!(C.look > 0)) return this.aimScripted(obs, a, null)
+    const sub = C.look === LOOK_OBJ ? this.secondaryTarget(obs) : null
+    if (sub) this.engageObject(obs, a, sub)
+    else a.aim = [this.lookYaw + (LOOK_OFFS[C.look] ?? 0), 0]
     this.releaseLaserIfIdle(obs, a)
   }
 

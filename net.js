@@ -70,9 +70,14 @@ export class PolicyNet {
   }
   get isLstm() { return !!this.W['lstm.weight_ih'] }
 
-  // state: {h, c} from the previous step (LSTM only); after the call, this.lastState holds the new state
-  forward(e, state) {
+  // state: {h, c} from the previous step (LSTM only); after the call, this.lastState holds the new state.
+  // heads: head list (default bot/actions.js HEADS); a target head with autoFirst puts "auto" at index 0 (bot/brain_heads.js)
+  forward(e, state, heads = HEADS) {
     const relu = (v) => v.map((x) => (x > 0 ? x : 0))
+    // weights wider than the self vector (trained with OBS_V2=1, run without) would read past its end -> NaN; fail loudly.
+    // Narrower weights (older checkpoint, OBS_V2 inputs appended) just ignore the tail, same as load_warm's zero pad.
+    const nSelf = this.W['self_fc.weight'].shape[1]
+    if (nSelf > e.self.length) throw new Error(`policy expects a self vector of ${nSelf}, encoder gives ${e.self.length} (OBS_V2 mismatch?)`)
     const hs = relu(this.lin('self_fc', e.self))
     const E = this.W['ent_fc.weight'].shape[0]
     const ents = []
@@ -129,14 +134,14 @@ export class PolicyNet {
     const tl = new Float32Array(NTGT + 1)
     for (let n = 0; n < NTGT; n++) tl[n] = e.tmask[n] < 0.5 ? -1e9 : dot(tq, e2[n]) * sc
     tl[NTGT] = e.tmask[NTGT] < 0.5 ? -1e9 : this.lin('t_auto', z)[0]
-    return HEADS.map((h, i) => {
-      if (h.name === 'target') return tl
+    return heads.map((h, i) => {
+      if (h.name === 'target') { if (!h.autoFirst) return tl; const r = new Float32Array(NTGT + 1); r[0] = tl[NTGT]; r.set(tl.subarray(0, NTGT), 1); return r }
       return this.W['h_' + h.name + '.weight'] ? this.lin('h_' + h.name, z) : null
     })
   }
 
   // MECH_BIAS (test only): JSON {headIndex: [per-class logit offsets]} added before argmax
-  act(e, state) { return this.forward(e, state).map((v, i) => (v ? argmax(BIAS[i] ? v.map((x, j) => x + (BIAS[i][j] || 0)) : v) : null)) }
+  act(e, state, heads) { return this.forward(e, state, heads).map((v, i) => (v ? argmax(BIAS[i] ? v.map((x, j) => x + (BIAS[i][j] || 0)) : v) : null)) }
 }
 
 function sig(x) { return 1 / (1 + Math.exp(-x)) }

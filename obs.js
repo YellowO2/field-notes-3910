@@ -17,8 +17,16 @@ export const NSND = 8
 // previous-action input is off by default: with it, imitation scored 1.42 vs 2.88 without (the network learned to
 // repeat itself). NO_PREV=0 turns it back on.
 const NO_PREV = typeof process === 'undefined' || process.env?.NO_PREV !== '0'
+// TGT_FIX=1: only enemies visible this tick are selectable target slots ('auto' always allowed)
+const TGT_FIX = typeof process !== 'undefined' && process.env?.TGT_FIX === '1'
 export const OFFER_COL = 35 + UPGRADES.length // 57
-export const NENT = 24, ENT = 24, NTGT = 8, SELF = 35 + UPGRADES.length + 1 + 3 * UPGRADES.length + 3 + 12 + 6 + NSND * 7 + 4 * 4
+// OBS_V2=1: extra inputs appended at the END of the self vector (rl/net.py load_warm zero-pads their weights):
+// beams 4 x 6, attacker flags per target slot 8, more remembered pickups 6 x 7, gun reloading flag 1 (= 75).
+// It also fixes three existing fields: gun ammo = true mag fraction (reloading is the new flag), laser cooldown
+// normalised by the weapon's own cooldown stat, and the 4 most threatening projectiles instead of the first 4.
+export const OBS_V2 = typeof process !== 'undefined' && process.env?.OBS_V2 === '1'
+const NBEAM = 4, NPICK2 = 6, V2_EXTRA = NBEAM * 6 + 8 + NPICK2 * 7 + 1
+export const NENT = 24, ENT = 24, NTGT = 8, SELF = 35 + UPGRADES.length + 1 + 3 * UPGRADES.length + 3 + 12 + 6 + NSND * 7 + 4 * 4 + (OBS_V2 ? V2_EXTRA : 0)
 const WEAP = ['gun', 'mortar', 'laser', 'lightning']
 const SND_FIRE = new Set(['gun', 'mortar', 'laser', 'laser_charge', 'lightning', 'npc_gun']), SND_MOVE = new Set(['step', 'boost', 'jet'])
 const TYPES = ['enemy', 'npc', 'bullet', 'shell', 'pickup', 'cube', 'crate', 'drop']
@@ -61,8 +69,8 @@ export class ObsEncoder {
     for (let slot = 0; slot < 2; slot++) for (const w of WEAP) s[k++] = W[slot] && W[slot].kind === w ? 1 : 0
     const laser = W.find((w) => w && w.kind === 'laser'), gun = W.find((w) => w && w.kind === 'gun')
     s[k++] = laser ? Math.min(1, laser.charge / laser.stats.charge) : 0
-    s[k++] = laser ? Math.min(1, laser.cooldown / 1.65) : 0
-    s[k++] = gun ? (gun.reload > 0 ? 0 : gun.ammo / gun.stats.mag) : 0
+    s[k++] = laser ? Math.min(1, laser.cooldown / (OBS_V2 ? Math.max(0.05, laser.stats.cooldown ?? 1.65) : 1.65)) : 0
+    s[k++] = gun ? (gun.reload > 0 && !OBS_V2 ? 0 : gun.ammo / gun.stats.mag) : 0
     s[k++] = (px - this.mx0) / (this.mcw * MW) * 2 - 1; s[k++] = (py - this.my0) / (this.mch * MH) * 2 - 1; s[k++] = pz / 30
     const [vu, vv] = egoV(me.vel[0], me.vel[1])
     s[k++] = vu / 20; s[k++] = vv / 20; s[k++] = me.vel[2] / 10
@@ -112,14 +120,43 @@ export class ObsEncoder {
       if (!n) { k += 4; continue }
       s[k++] = Math.cos(n.dir - yaw); s[k++] = Math.sin(n.dir - yaw); s[k++] = Math.min(n.len, 400) / 400; s[k++] = 1
     }
+    const foes = [...(brain.enemies?.values() ?? [])].filter((e) => t - e.t < 8)
+      .sort((a, b) => Math.hypot(a.pos[0] - px, a.pos[1] - py) - Math.hypot(b.pos[0] - px, b.pos[1] - py))
+    const near = (arr) => arr.slice().sort((a, b) => Math.hypot(a.pos[0] - px, a.pos[1] - py) - Math.hypot(b.pos[0] - px, b.pos[1] - py))
+    const pickMem = brain.pickMem ? [...brain.pickMem.entries()].map(([id, p]) => ({ id, ...p })) : obs.pickups.map((p) => ({ ...p, t }))
+    const pick3 = near(pickMem.filter((q) => q.kind !== 'gun')).slice(0, 3)
+    if (OBS_V2) {
+      // seen beams (laser / lightning shooters, even outside the view cone): newest first
+      const bm = (brain.beams ?? []).filter((x) => t - x.t < 4).slice(-NBEAM).reverse()
+      for (let j = 0; j < NBEAM; j++) {
+        const b = bm[j]
+        if (!b) { k += 6; continue }
+        const br = Math.atan2(b.pos[1] - py, b.pos[0] - px)
+        s[k++] = Math.cos(br - yaw); s[k++] = Math.sin(br - yaw); s[k++] = Math.min(Math.hypot(b.pos[0] - px, b.pos[1] - py), 400) / 400
+        s[k++] = b.kind === 'laser' ? 1 : 0; s[k++] = b.kind === 'lightning' ? 1 : 0; s[k++] = 1 - (t - b.t) / 4
+      }
+      // target slot j (same order as the enemy entity rows / pointer head) damaged me within the last 4 s
+      const ra = brain.recentAttackers
+      for (let j = 0; j < NTGT; j++) { const e = foes[j], ta = e && ra?.get(e.id); s[k++] = ta != null && t - ta < 4 ? 1 : 0 }
+      // up to 6 more remembered pickups beyond the 3 entity rows: lasers and lightning first, then mortars, then guns
+      const used = new Set(pick3.map((p) => p.id)), prio = (q) => (q.kind === 'laser' || q.kind === 'lightning' ? 0 : q.kind === 'mortar' ? 1 : 2)
+      const dist = (q) => Math.hypot(q.pos[0] - px, q.pos[1] - py)
+      const more = pickMem.filter((q) => !used.has(q.id)).sort((a, b) => prio(a) - prio(b) || dist(a) - dist(b)).slice(0, NPICK2)
+      for (let j = 0; j < NPICK2; j++) {
+        const p = more[j]
+        if (!p) { k += 7; continue }
+        const br = Math.atan2(p.pos[1] - py, p.pos[0] - px)
+        s[k++] = Math.cos(br - yaw); s[k++] = Math.sin(br - yaw); s[k++] = Math.min(dist(p), 400) / 400
+        for (const w of WEAP) s[k++] = p.kind === w ? 1 : 0
+      }
+      s[k++] = gun && gun.reload > 0 ? 1 : 0
+    }
     if (k !== SELF) throw new Error(`self vector size ${k} != ${SELF}`)
     // ---------------- entities
     const ents = new Float32Array(NENT * ENT), mask = new Float32Array(NENT), tmask = new Float32Array(NTGT + 1)
     const tids = []
     const rows = []
     const mz = pz + (me.stats?.muzzle_height ?? 7)
-    const foes = [...(brain.enemies?.values() ?? [])].filter((e) => t - e.t < 8)
-      .sort((a, b) => Math.hypot(a.pos[0] - px, a.pos[1] - py) - Math.hypot(b.pos[0] - px, b.pos[1] - py))
     for (const e of foes.slice(0, NTGT)) {
       const size = 1 + 0.05 * (e.cubes ?? 0)
       const lof = e.seenNow && map.los(px, py, mz, e.pos[0], e.pos[1], e.pos[2] + 4.5 * size) ? 1 : 0
@@ -130,15 +167,13 @@ export class ObsEncoder {
         e.aim ? Math.cos(bearingToMe - e.aim[0]) : 0, e.seenNow ? 1 : 0, Math.min(t - e.t, 8) / 8, lof] })
       tids.push(e.id)
     }
-    const near = (arr) => arr.slice().sort((a, b) => Math.hypot(a.pos[0] - px, a.pos[1] - py) - Math.hypot(b.pos[0] - px, b.pos[1] - py))
     // drones, loot and cubes come from memory (seen recently), with age and a visible-now flag
     const visN = new Set(obs.mechs.filter((x) => x.kind === 'npc').map((x) => x.id))
     const visP = new Set(obs.pickups.map((x) => x.id)), visC = new Set(obs.cubes.map((x) => x.id))
     const npcMem = brain.npcs ? [...brain.npcs.entries()].map(([id, n]) => ({ id, ...n })) : obs.mechs.filter((x) => x.kind === 'npc').map((n) => ({ ...n, t }))
     for (const n of near(npcMem).slice(0, 4)) rows.push({ type: 'npc', pos: n.pos, vel: n.vel ?? [0, 0, 0], extra: [n.hp / 350, Math.min(t - n.t, 25) / 25, visN.has(n.id) ? 1 : 0] })
-    for (const p of obs.projectiles.slice(0, 4)) rows.push({ type: p.kind === 'mortar' ? 'shell' : 'bullet', pos: p.pos, vel: p.vel, extra: [] })
-    const pickMem = brain.pickMem ? [...brain.pickMem.entries()].map(([id, p]) => ({ id, ...p })) : obs.pickups.map((p) => ({ ...p, t }))
-    for (const p of near(pickMem.filter((q) => q.kind !== 'gun')).slice(0, 3)) rows.push({ type: 'pickup', pos: p.pos, vel: [0, 0, 0], extra: [0, 0, 0, p.kind === 'laser' ? 1 : 0, p.kind === 'lightning' ? 1 : 0, p.kind === 'mortar' ? 1 : 0, Math.min(t - p.t, 40) / 40, visP.has(p.id) ? 1 : 0] })
+    for (const p of (OBS_V2 ? threatSort(obs.projectiles, px, py, pz) : obs.projectiles).slice(0, 4)) rows.push({ type: p.kind === 'mortar' ? 'shell' : 'bullet', pos: p.pos, vel: p.vel, extra: [] })
+    for (const p of pick3) rows.push({ type: 'pickup', pos: p.pos, vel: [0, 0, 0], extra: [0, 0, 0, p.kind === 'laser' ? 1 : 0, p.kind === 'lightning' ? 1 : 0, p.kind === 'mortar' ? 1 : 0, Math.min(t - p.t, 40) / 40, visP.has(p.id) ? 1 : 0] })
     const cubeMem = brain.cubeMem ? [...brain.cubeMem.entries()].map(([id, c]) => ({ id, ...c })) : obs.cubes.map((c) => ({ ...c, t }))
     for (const c of near(cubeMem).slice(0, 3)) rows.push({ type: 'cube', pos: c.pos, vel: [0, 0, 0], extra: [Math.min(t - c.t, 40) / 40, visC.has(c.id) ? 1 : 0] })
     for (const c of near(obs.crates).slice(0, 1)) rows.push({ type: 'crate', pos: c.pos, vel: [0, 0, 0], extra: [c.hp / 300] })
@@ -153,7 +188,7 @@ export class ObsEncoder {
       ents[o + 12] = ru / 20; ents[o + 13] = rv / 20
       r.extra.forEach((x, j) => { if (14 + j < ENT) ents[o + 14 + j] = x })
     })
-    for (let i = 0; i < tids.length; i++) tmask[i] = 1
+    for (let i = 0; i < tids.length; i++) tmask[i] = TGT_FIX && !foes[i].seenNow ? 0 : 1
     tmask[NTGT] = 1
 
     // ---------------- local grid (egocentric, rotated)
@@ -204,6 +239,17 @@ export class ObsEncoder {
 
     return { self: s, ents, mask, tmask, tids, local, mini }
   }
+}
+
+// projectiles ordered by threat: predicted closest approach to me within 2 s (3D), plus a small penalty for time-to-closest
+function threatSort(arr, px, py, pz) {
+  const score = (p) => {
+    const dx = p.pos[0] - px, dy = p.pos[1] - py, dz = p.pos[2] - (pz + 4), [vx, vy, vz] = p.vel
+    const vv = vx * vx + vy * vy + vz * vz
+    const tc = vv > 1e-6 ? Math.min(2, Math.max(0, -(dx * vx + dy * vy + dz * vz) / vv)) : 0
+    return Math.hypot(dx + vx * tc, dy + vy * tc, dz + vz * tc) + 5 * tc
+  }
+  return arr.map((p) => [score(p), p]).sort((a, b) => a[0] - b[0]).map((x) => x[1])
 }
 
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v }
