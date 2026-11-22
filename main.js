@@ -1,4 +1,5 @@
-import { Pilot } from './pilot.js'
+import { GiddyBrain } from './brain.js'
+import { loadWorld } from './world.js'
 
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n')
 let bot = null, last = {}, buf = '', queued = false
@@ -9,7 +10,7 @@ function handle(lines) {
     let msg
     try { msg = JSON.parse(line) } catch { continue }
     if (msg.type === 'hello') {
-      try { bot = new Pilot(msg) } catch (e) { process.stderr.write(String(e?.stack ?? e) + '\n') }
+      try { bot = new GiddyBrain(msg, loadWorld(msg.map?.dir ?? '/arena')) } catch (e) { process.stderr.write(String(e?.stack ?? e) + '\n') }
       send({ type: 'ready', name: 'fn' })
     } else if (msg.type === 'obs') latest = msg
     else if (msg.type === 'end') process.exit(0)
